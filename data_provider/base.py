@@ -29,7 +29,7 @@ from src.data.stock_mapping import STOCK_NAME_MAP, is_meaningful_stock_name
 from src.services.market_symbol_utils import is_suffix_market_symbol
 from src.services.run_diagnostics import record_provider_run, record_provider_run_started
 from src.services.stock_list_parser import AnalysisTarget, ParseStatus, parse_analysis_target
-from .fundamental_adapter import AkshareFundamentalAdapter
+from .fundamental_adapter import AkshareFundamentalAdapter, HithinkFundamentalAdapter
 from .yfinance_fundamental_adapter import YfinanceFundamentalAdapter
 from .realtime_types import CircuitBreaker
 
@@ -637,6 +637,7 @@ class DataFetcherManager:
         "AkshareFetcher": {"cn", "hk"},
         "TushareFetcher": {"cn", "hk"},
         "TickFlowFetcher": {"cn"},
+        "HithinkFetcher": {"cn"},
         # 妙想为垂直补充数据源（资金流/筹码分布），不提供日线行情
         "MiaoxiangFetcher": set(),
         "PytdxFetcher": {"cn"},
@@ -649,6 +650,7 @@ class DataFetcherManager:
     }
     _daily_source_health = CircuitBreaker(failure_threshold=3, cooldown_seconds=300.0)
     _CN_INDEX_DAILY_SOURCE_ORDER = (
+        "HithinkFetcher",
         "TencentFetcher",
         "AkshareFetcher",
         "TickFlowFetcher",
@@ -698,12 +700,15 @@ class DataFetcherManager:
         else:
             # 默认数据源将在首次使用时延迟加载
             self._init_default_fetchers()
-        self._fundamental_adapter = AkshareFundamentalAdapter()
+        self._fundamental_adapter = self._build_fundamental_adapter()
         self._yfinance_fundamental_adapter = YfinanceFundamentalAdapter()
         self._futu_fundamental_fetcher = None
         self._tickflow_fetcher = None
         self._tickflow_api_key: Optional[str] = None
         self._tickflow_lock = RLock()
+        self._hithink_fetcher = None
+        self._hithink_api_key: Optional[str] = None
+        self._hithink_lock = RLock()
         self._fundamental_cache: Dict[str, Dict[str, Any]] = {}
         self._fundamental_cache_lock = RLock()
         self._fundamental_timeout_worker_limit = 8
@@ -928,6 +933,8 @@ class DataFetcherManager:
         if fetcher_name in {"TencentFetcher", "AkshareFetcher"}:
             return f"{exchange.lower()}{entry.bare_code}"
         if fetcher_name == "TickFlowFetcher":
+            return f"{entry.bare_code}.{exchange}"
+        if fetcher_name == "HithinkFetcher":
             return f"{entry.bare_code}.{exchange}"
         if fetcher_name == "YfinanceFetcher":
             suffix = "SS" if exchange == "SH" else "SZ"
@@ -1474,6 +1481,21 @@ class DataFetcherManager:
         logger.warning("[指数名称] 所有数据源都无法获取 %s 的名称", cache_key)
         return cache_key
 
+    def _build_fundamental_adapter(self):
+        """基本面适配器：配了 HITHINK_API_KEY 时用 Hithink（Akshare 仅回填
+        Hithink 没有的业绩预告 / 快报 / 分红 / 机构持股块），否则用 Akshare。"""
+        from src.config import get_config
+
+        config = get_config()
+        hithink_api_key = getattr(config, "hithink_api_key", None)
+        if isinstance(hithink_api_key, str):
+            hithink_api_key = hithink_api_key.strip()
+        if hithink_api_key:
+            return HithinkFundamentalAdapter(
+                api_key=hithink_api_key, fallback=AkshareFundamentalAdapter()
+            )
+        return AkshareFundamentalAdapter()
+
     def _get_tickflow_fetcher(self):
         """Lazily create a TickFlow fetcher for market-review-only calls."""
         from src.config import get_config
@@ -1528,6 +1550,55 @@ class DataFetcherManager:
                 logger.warning("[TickFlowFetcher] 初始化失败: %s", exc)
                 self._tickflow_fetcher = None
                 self._tickflow_api_key = None
+                return None
+
+    def _get_hithink_fetcher(self):
+        """Lazily create a Hithink fetcher for market-review-only calls.
+
+        与 _get_tickflow_fetcher 同款模式：优先复用已注册的实例，
+        未注册时按当前配置新建一个（HithinkFetcher 无需 close）。
+        """
+        from src.config import get_config
+
+        config = get_config()
+        api_key = (getattr(config, "hithink_api_key", None) or "").strip()
+
+        if not hasattr(self, "_hithink_lock") or self._hithink_lock is None:
+            self._hithink_lock = RLock()
+
+        with self._hithink_lock:
+            current_fetcher = getattr(self, "_hithink_fetcher", None)
+            current_key = getattr(self, "_hithink_api_key", None)
+
+            if not api_key:
+                self._hithink_fetcher = None
+                self._hithink_api_key = None
+                return None
+
+            configured_fetcher = self._get_fetcher_by_name("HithinkFetcher")
+            if configured_fetcher is not None:
+                return configured_fetcher
+
+            if current_fetcher is not None and current_key == api_key:
+                return current_fetcher
+
+            try:
+                from .hithink_fetcher import HithinkFetcher
+
+                fetcher = HithinkFetcher(
+                    api_key=api_key,
+                    kline_adjust=getattr(config, "hithink_kline_adjust", "forward"),
+                    batch_daily_enabled=True,
+                    batch_size=10,
+                    priority=getattr(config, "hithink_priority", 0),
+                )
+                self._hithink_fetcher = fetcher
+                self._hithink_api_key = api_key
+                return fetcher
+            except Exception as exc:
+                logger.warning("[HithinkFetcher] 初始化失败: %s", exc)
+                self._hithink_fetcher = None
+                self._hithink_api_key = None
                 return None
 
     def close(self) -> None:
@@ -1797,7 +1868,8 @@ class DataFetcherManager:
         - 如果配置了 Longbridge OAuth 或 Legacy 凭据：实例化 LongbridgeFetcher 作为美股/港股兜底
         - 未配置的可选数据源不实例化，避免在批量拉取时反复探测无效源
         - 默认优先级：
-          0. EfinanceFetcher (Priority 0) - 最高优先级
+          0. HithinkFetcher (Priority 0) - 最高优先级（需配置 HITHINK_API_KEY）
+          0. EfinanceFetcher (Priority 0) - 与 Hithink 同级时排在其后
           1. AkshareFetcher (Priority 1)
           2. PytdxFetcher (Priority 2) - 通达信
           3. BaostockFetcher (Priority 3)
@@ -1845,6 +1917,23 @@ class DataFetcherManager:
         else:
             logger.debug("[data source init] skip TickFlowFetcher because TICKFLOW_API_KEY is not configured")
 
+        # 同花顺 Hithink：配了 HITHINK_API_KEY 时作为 A 股第一优先级
+        # （priority 默认 0，与 Efinance 同级时靠列表顺序排在最前）。
+        hithink_api_key = (getattr(config, "hithink_api_key", None) or "").strip()
+        hithink_fetcher = None
+        if hithink_api_key:
+            from .hithink_fetcher import HithinkFetcher
+
+            hithink_fetcher = HithinkFetcher(
+                api_key=hithink_api_key,
+                kline_adjust=getattr(config, "hithink_kline_adjust", "forward"),
+                batch_daily_enabled=True,
+                batch_size=10,
+                priority=getattr(config, "hithink_priority", 0),
+            )
+        else:
+            logger.debug("[data source init] skip HithinkFetcher because HITHINK_API_KEY is not configured")
+
         mx_apikey = getattr(config, "mx_apikey", None)
         if not isinstance(mx_apikey, str):
             mx_apikey = ""
@@ -1888,7 +1977,10 @@ class DataFetcherManager:
         # 初始化数据源列表
         self._ensure_concurrency_guards()
         with self._fetchers_lock:
+            # Hithink 排在最前：与 Efinance 同为 priority 0 时，稳定排序按
+            # 初始化顺序取 Hithink 为先，确保切源后 Hithink 为第一优先级。
             self._fetchers = [
+                *([hithink_fetcher] if hithink_fetcher is not None else []),
                 efinance,
                 akshare,
                 pytdx,
@@ -2681,6 +2773,16 @@ class DataFetcherManager:
                         )
                         quote = self._call_fetcher_method(fetcher, 'get_realtime_quote', raw_stock_code or stock_code)
 
+                elif source == "hithink":
+                    fetcher = self._get_fetcher_by_name("HithinkFetcher", capability="realtime_quote")
+                    if fetcher is not None and hasattr(fetcher, 'get_realtime_quote'):
+                        record_provider_run_started(
+                            data_type="realtime_quote",
+                            provider=fetcher.name,
+                            operation="get_realtime_quote",
+                        )
+                        quote = self._call_fetcher_method(fetcher, 'get_realtime_quote', raw_stock_code or stock_code)
+
                 provider_name = fetcher.name if fetcher is not None else source
                 
                 if quote is not None and quote.has_basic_data():
@@ -3285,6 +3387,16 @@ class DataFetcherManager:
     def get_main_indices(self, region: str = "cn") -> List[Dict[str, Any]]:
         """获取主要指数实时行情（自动切换数据源）"""
         if region == "cn":
+            hithink_fetcher = self._get_hithink_fetcher()
+            if hithink_fetcher is not None:
+                try:
+                    data = hithink_fetcher.get_main_indices(region=region)
+                    if data:
+                        logger.info("[HithinkFetcher] 获取指数行情成功")
+                        return data
+                except Exception as e:
+                    logger.warning(f"[HithinkFetcher] 获取指数行情失败: {e}")
+
             tickflow_fetcher = self._get_tickflow_fetcher()
             if tickflow_fetcher is not None:
                 try:
@@ -3296,7 +3408,7 @@ class DataFetcherManager:
                     logger.warning(f"[TickFlowFetcher] 获取指数行情失败: {e}")
 
         for fetcher in self._fetchers:
-            if region == "cn" and fetcher.name == "TickFlowFetcher":
+            if region == "cn" and fetcher.name in {"TickFlowFetcher", "HithinkFetcher"}:
                 continue
             try:
                 data = fetcher.get_main_indices(region=region)
@@ -3311,6 +3423,36 @@ class DataFetcherManager:
     def get_market_stats(self, *, purpose: str = "unspecified") -> Dict[str, Any]:
         """获取市场涨跌统计（自动切换数据源）"""
         logger.info("[MarketStats] component=market_stats action=start purpose=%s", purpose)
+        hithink_fetcher = self._get_hithink_fetcher()
+        if hithink_fetcher is not None:
+            started_at = time.monotonic()
+            try:
+                data = hithink_fetcher.get_market_stats()
+                elapsed = time.monotonic() - started_at
+                if data:
+                    logger.info(
+                        "[MarketStats] component=market_stats action=provider_success "
+                        "purpose=%s provider=HithinkFetcher elapsed=%.2fs",
+                        purpose,
+                        elapsed,
+                    )
+                    return data
+                logger.info(
+                    "[MarketStats] component=market_stats action=provider_empty "
+                    "purpose=%s provider=HithinkFetcher elapsed=%.2fs",
+                    purpose,
+                    elapsed,
+                )
+            except Exception as e:
+                elapsed = time.monotonic() - started_at
+                logger.warning(
+                    "[MarketStats] component=market_stats action=provider_failed "
+                    "purpose=%s provider=HithinkFetcher elapsed=%.2fs error=%s",
+                    purpose,
+                    elapsed,
+                    e,
+                )
+
         tickflow_fetcher = self._get_tickflow_fetcher()
         if tickflow_fetcher is not None:
             started_at = time.monotonic()
@@ -3342,7 +3484,7 @@ class DataFetcherManager:
                 )
 
         for fetcher in self._fetchers:
-            if fetcher.name == "TickFlowFetcher":
+            if fetcher.name in {"TickFlowFetcher", "HithinkFetcher"}:
                 continue
             started_at = time.monotonic()
             try:

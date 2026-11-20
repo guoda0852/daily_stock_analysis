@@ -123,6 +123,7 @@ _FALSEY_ENV_VALUES = {"0", "false", "no", "off"}
 PROMPT_CACHE_DIAGNOSTICS_LEVELS = {"off", "basic", "debug"}
 SUPPORTED_AGENT_BACKENDS = {"auto", "litellm", "codex_app_server"}
 TICKFLOW_KLINE_ADJUST_VALUES = {"none", "forward", "backward", "forward_additive", "backward_additive"}
+HITHINK_KLINE_ADJUST_VALUES = {"forward", "backward", "none"}
 # Fallback defaults used when ANSPIRE_API_KEYS is reused as legacy OpenAI-compatible source.
 # These are compatibility examples; actual availability should be validated by Anspire console/model entitlement.
 ANSPIRE_LLM_BASE_URL_DEFAULT = "https://open-gateway.anspire.cn/v6"
@@ -164,6 +165,18 @@ def normalize_tickflow_kline_adjust(value: Optional[str]) -> str:
         value,
     )
     return "none"
+
+
+def normalize_hithink_kline_adjust(value: Optional[str]) -> str:
+    """Normalize Hithink daily K-line adjustment mode (API default: forward)."""
+    normalized = (value or "forward").strip().lower()
+    if normalized in HITHINK_KLINE_ADJUST_VALUES:
+        return normalized
+    logger.warning(
+        "Invalid HITHINK_KLINE_ADJUST=%r; falling back to forward",
+        value,
+    )
+    return "forward"
 
 
 def parse_prompt_cache_diagnostics_level(value: Optional[str]) -> str:
@@ -928,6 +941,10 @@ class Config:
     tickflow_priority: int = 2
     tickflow_batch_daily_enabled: bool = True
     tickflow_batch_size: int = 100
+    # 同花顺 Hithink Financial-API（A 股第一优先级，需配 HITHINK_API_KEY）
+    hithink_api_key: Optional[str] = None
+    hithink_kline_adjust: str = "forward"
+    hithink_priority: int = 0
     futu_opend_host: Optional[str] = None
     futu_opend_port: int = 11111
     futu_hk_realtime_source_priority: str = "futu,longbridge,akshare,yfinance"
@@ -1271,7 +1288,8 @@ class Config:
     # - akshare_sina: 新浪财经，基本行情稳定，但无量比
     # - efinance/akshare_em: 东财全量接口，数据最全但容易被封
     # - tushare: Tushare Pro，需要2000积分，数据全面（付费用户可优先使用）
-    realtime_source_priority: str = "tencent,akshare_sina,efinance,akshare_em"
+    # - hithink: 同花顺 Financial-API，配了 HITHINK_API_KEY 时为实时行情首选
+    realtime_source_priority: str = "hithink,tencent,akshare_sina,efinance,akshare_em"
     # 实时行情缓存时间（秒）
     realtime_cache_ttl: int = 600
     # 熔断器冷却时间（秒）
@@ -1844,6 +1862,9 @@ class Config:
             tickflow_priority=parse_env_int(os.getenv('TICKFLOW_PRIORITY'), 2, field_name='TICKFLOW_PRIORITY', minimum=0),
             tickflow_batch_daily_enabled=parse_env_bool(os.getenv('TICKFLOW_BATCH_DAILY_ENABLED'), default=True),
             tickflow_batch_size=parse_env_int(os.getenv('TICKFLOW_BATCH_SIZE'), 100, field_name='TICKFLOW_BATCH_SIZE', minimum=1),
+            hithink_api_key=os.getenv('HITHINK_API_KEY'),
+            hithink_kline_adjust=normalize_hithink_kline_adjust(os.getenv('HITHINK_KLINE_ADJUST')),
+            hithink_priority=parse_env_int(os.getenv('HITHINK_PRIORITY'), 0, field_name='HITHINK_PRIORITY', minimum=0),
             futu_opend_host=os.getenv('FUTU_OPEND_HOST') or None,
             futu_opend_port=parse_env_int(os.getenv('FUTU_OPEND_PORT'), 11111, field_name='FUTU_OPEND_PORT', minimum=1, maximum=65535),
             futu_hk_realtime_source_priority=os.getenv('FUTU_HK_REALTIME_SOURCE_PRIORITY', 'futu,longbridge,akshare,yfinance'),
@@ -2997,11 +3018,12 @@ class Config:
     @classmethod
     def _resolve_realtime_source_priority(cls) -> str:
         """
-        Resolve realtime source priority with automatic tushare injection.
+        Resolve realtime source priority with automatic hithink/tushare injection.
 
-        When TUSHARE_TOKEN is configured but REALTIME_SOURCE_PRIORITY is not
-        explicitly set, automatically prepend 'tushare' to the default priority
-        so that the paid data source is utilized for realtime quotes as well.
+        When HITHINK_API_KEY (or TUSHARE_TOKEN) is configured but
+        REALTIME_SOURCE_PRIORITY is not explicitly set, automatically prepend
+        the paid source(s) to the default priority so that the paid data
+        source is utilized for realtime quotes as well. Hithink goes first.
         """
         explicit = os.getenv('REALTIME_SOURCE_PRIORITY')
         default_priority = 'tencent,akshare_sina,efinance,akshare_em'
@@ -3010,19 +3032,25 @@ class Config:
             # User explicitly set priority, respect it
             return explicit
 
+        import logging
+        logger = logging.getLogger(__name__)
+        resolved = default_priority
         tushare_token = os.getenv('TUSHARE_TOKEN', '').strip()
         if tushare_token:
             # Token configured but no explicit priority override
             # Prepend tushare so the paid source is tried first
-            import logging
-            logger = logging.getLogger(__name__)
-            resolved = f'tushare,{default_priority}'
+            resolved = f'tushare,{resolved}'
             logger.info(
                 f"TUSHARE_TOKEN detected, auto-injecting tushare into realtime priority: {resolved}"
             )
-            return resolved
+        hithink_api_key = os.getenv('HITHINK_API_KEY', '').strip()
+        if hithink_api_key:
+            resolved = f'hithink,{resolved}'
+            logger.info(
+                f"HITHINK_API_KEY detected, auto-injecting hithink into realtime priority: {resolved}"
+            )
 
-        return default_priority
+        return resolved
 
     @classmethod
     def reset_instance(cls) -> None:

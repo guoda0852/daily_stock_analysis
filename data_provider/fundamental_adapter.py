@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
+import requests
 
 logger = logging.getLogger(__name__)
 
@@ -622,4 +623,328 @@ class AkshareFundamentalAdapter:
         )
         result["status"] = "ok"
         result["source_chain"].append(f"dragon_tiger:{source}")
+        return result
+
+
+# ----------------------------------------------------------------------
+# Hithink（同花顺 Financial-API）基本面适配器
+# ----------------------------------------------------------------------
+# 覆盖：成长指标（indicators）、财报（income/balance/cash-flow statements）、
+# 估值快照（valuations/snapshot）、个股资金流（capital-flow/snapshot）、
+# 龙虎榜上榜标记（special-data/dragon-tiger-list）。
+# 明确不覆盖（Hithink 无此端点）：业绩预告 / 业绩快报 / 分红明细 /
+# 机构持股变化 / 十大流通股东变化 —— 这些块由可选的 Akshare fallback
+# 适配器回填（仅补缺失键，Hithink 已给的块不动），source_chain 中注明来源。
+# 主力净流入定义：超大单净额 + 大单净额（与东财“主力净流入”口径相近，
+# 非同一上游，跨源对比时以 source_chain 为准）。
+_HITHINK_BASE_URL = "https://fuyao.aicubes.cn"
+
+
+def _hithink_thscode(stock_code: str) -> str:
+    """本文件内复用：各种代码写法 → Hithink thscode（600519.SH）。"""
+    raw = (stock_code or "").strip().upper()
+    if not raw:
+        return ""
+    if raw.startswith(("SH", "SZ", "BJ")):
+        return f"{raw[2:]}.{raw[:2]}"
+    if "." in raw:
+        code, suffix = raw.split(".", 1)
+        suffix = suffix.upper()
+        if suffix == "SS":
+            return f"{code}.SH"
+        return f"{code}.{suffix}"
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if len(digits) != 6:
+        return raw
+    if digits.startswith(("60", "68", "90")):
+        return f"{digits}.SH"
+    if digits.startswith(("43", "92")):
+        return f"{digits}.BJ"
+    return f"{digits}.SZ"
+
+
+def _report_date_to_hithink(report_date: str) -> Optional[str]:
+    """YYYYMMDD → Hithink indicators 报告期格式 yyyy-q（1=一季报…4=年报）。"""
+    digits = "".join(ch for ch in str(report_date) if ch.isdigit())
+    if len(digits) != 8:
+        return None
+    year, month = int(digits[0:4]), int(digits[4:6])
+    quarter = (month - 1) // 3 + 1
+    return f"{year}-{quarter}"
+
+
+class HithinkFundamentalAdapter:
+    """同花顺 Hithink 基本面适配器（fail-open，与 Akshare 版同接口）。"""
+
+    def __init__(self, api_key: str, timeout: int = 30, fallback: Any = None) -> None:
+        self.api_key = (api_key or "").strip()
+        if not self.api_key:
+            raise ValueError("HithinkFundamentalAdapter 需要 HITHINK_API_KEY")
+        self.timeout = timeout
+        self.fallback = fallback
+
+    def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        try:
+            resp = requests.get(
+                f"{_HITHINK_BASE_URL}{path}",
+                headers={"X-api-key": self.api_key},
+                params=params or {},
+                timeout=self.timeout,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+        except Exception as exc:  # noqa: BLE001 - fail-open：调用方按 partial 处理
+            logger.debug("[HithinkFundamental] 请求失败 %s: %s", path, exc)
+            return None
+        if not isinstance(payload, dict) or payload.get("code") != 0:
+            logger.debug(
+                "[HithinkFundamental] 业务错误 %s: code=%s",
+                path,
+                payload.get("code") if isinstance(payload, dict) else "?",
+            )
+            return None
+        data = payload.get("data")
+        return data if isinstance(data, dict) else None
+
+    def _latest_indicators(self, thscode: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """取最近两期报告期的 indicators，返回（指标字典，报告期）。"""
+        for report_date in _recent_report_dates():
+            report = _report_date_to_hithink(report_date)
+            if not report:
+                continue
+            data = self._get(
+                "/api/a-share/financials/indicators",
+                {"thscode": thscode, "report": report},
+            )
+            if not data:
+                continue
+            flat: Dict[str, Any] = {}
+            for block in data.get("abilities") or []:
+                for indicator in block.get("indicators") or []:
+                    index_id = indicator.get("index_id")
+                    if index_id:
+                        flat[index_id] = _safe_float(indicator.get("value"))
+            if flat:
+                return flat, report
+        return None, None
+
+    def get_fundamental_bundle(self, stock_code: str) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "status": "not_supported",
+            "growth": {},
+            "earnings": {},
+            "institution": {},
+            "source_chain": [],
+            "errors": [],
+        }
+        thscode = _hithink_thscode(stock_code)
+        if not thscode:
+            result["errors"].append(f"无法解析代码 {stock_code}")
+            return result
+
+        indicators, report = self._latest_indicators(thscode)
+        if indicators:
+            growth_payload = {
+                "revenue_yoy": indicators.get("operating_income_yoy_growth_ratio"),
+                "net_profit_yoy": indicators.get("net_profit_yoy_growth_ratio"),
+                "roe": indicators.get("index_weighted_avg_roe"),
+                "gross_margin": indicators.get("sale_gross_margin"),
+            }
+            if any(v is not None for v in growth_payload.values()):
+                result["growth"] = growth_payload
+                result["source_chain"].append(f"growth:hithink_indicators@{report}")
+
+        income = self._get(
+            "/api/a-share/financials/income-statements",
+            {"thscode": thscode, "period": "quarterly", "limit": 1},
+        )
+        cashflow = self._get(
+            "/api/a-share/financials/cash-flow-statements",
+            {"thscode": thscode, "period": "quarterly", "limit": 1},
+        )
+        income_item = (income.get("item") or [None])[0] if income else None
+        cashflow_item = (cashflow.get("item") or [None])[0] if cashflow else None
+        if income_item or cashflow_item:
+            report_date = None
+            if income_item:
+                report_ms = income_item.get("report_date_ms") or income_item.get("period_end_ms")
+                if report_ms:
+                    try:
+                        report_date = datetime.fromtimestamp(
+                            int(report_ms) / 1000
+                        ).strftime("%Y%m%d")
+                    except (TypeError, ValueError):
+                        report_date = None
+            roe = (indicators or {}).get("index_weighted_avg_roe")
+            financial_report_payload = {
+                "report_date": report_date,
+                "revenue": _safe_float((income_item or {}).get("operating_income")),
+                "net_profit_parent": _safe_float(
+                    (income_item or {}).get("parent_holder_net_profit")
+                ),
+                "operating_cash_flow": _safe_float(
+                    (cashflow_item or {}).get("act_cash_flow_net")
+                ),
+                "roe": roe,
+            }
+            if any(
+                v is not None for k, v in financial_report_payload.items() if k != "report_date"
+            ):
+                result["earnings"]["financial_report"] = financial_report_payload
+                result["source_chain"].append("earnings_report:hithink_financials")
+
+        valuation = self._get(
+            "/api/a-share/valuations/snapshot", {"thscodes": thscode}
+        )
+        vitems = (valuation.get("item") or []) if valuation else []
+        if vitems:
+            item = vitems[0]
+            valuation_payload = {
+                "pe_ttm": _safe_float(item.get("pe_ttm")),
+                "pe_mrq": _safe_float(item.get("pe_mrq")),
+                "pb_mrq": _safe_float(item.get("pb_mrq")),
+                "ps_ttm": _safe_float(item.get("ps_ttm")),
+                "pcf_ttm": _safe_float(item.get("pcf_ttm")),
+            }
+            if any(v is not None for v in valuation_payload.values()):
+                result["earnings"]["valuation"] = valuation_payload
+                result["source_chain"].append("valuation:hithink_valuations")
+
+        # 回填 Hithink 没有的块（业绩预告 / 快报 / 分红 / 机构持股），仅补缺失键。
+        if self.fallback is not None:
+            try:
+                fallback_bundle = self.fallback.get_fundamental_bundle(stock_code)
+            except Exception as exc:  # noqa: BLE001 - fail-open
+                logger.debug("[HithinkFundamental] fallback bundle 失败: %s", exc)
+                fallback_bundle = {}
+            if isinstance(fallback_bundle, dict):
+                for key in ("forecast_summary", "quick_report_summary", "dividend"):
+                    if key not in result["earnings"] and fallback_bundle.get("earnings", {}).get(key):
+                        result["earnings"][key] = fallback_bundle["earnings"][key]
+                if not result["growth"] and fallback_bundle.get("growth"):
+                    result["growth"] = fallback_bundle["growth"]
+                if not result["institution"] and fallback_bundle.get("institution"):
+                    result["institution"] = fallback_bundle["institution"]
+                for entry in fallback_bundle.get("source_chain", []):
+                    if entry not in result["source_chain"]:
+                        result["source_chain"].append(entry)
+                result["errors"].extend(fallback_bundle.get("errors", []))
+
+        has_content = bool(result["growth"] or result["earnings"] or result["institution"])
+        result["status"] = "partial" if has_content else "not_supported"
+        return result
+
+    def get_capital_flow(self, stock_code: str, top_n: int = 5) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "status": "not_supported",
+            "stock_flow": {},
+            "sector_rankings": {"top": [], "bottom": []},
+            "source_chain": [],
+            "errors": [],
+        }
+        thscode = _hithink_thscode(stock_code)
+        if not thscode:
+            return result
+        data = self._get("/api/a-share/capital-flow/snapshot", {"thscode": thscode})
+        if data:
+            def _net(bucket: Any) -> Optional[float]:
+                if not isinstance(bucket, dict):
+                    return None
+                return _safe_float(bucket.get("net_amount"))
+
+            super_large = _net(data.get("super_large"))
+            large = _net(data.get("large"))
+            medium = _net(data.get("medium"))
+            small = _net(data.get("small"))
+            main_net = None
+            if super_large is not None or large is not None:
+                main_net = (super_large or 0.0) + (large or 0.0)
+            if main_net is not None:
+                result["stock_flow"] = {
+                    "main_net_inflow": main_net,
+                    "super_large_net": super_large,
+                    "large_net": large,
+                    "medium_net": medium,
+                    "small_net": small,
+                }
+                result["source_chain"].append("capital_stock:hithink_capital_flow")
+        if self.fallback is not None:
+            try:
+                fallback_flow = self.fallback.get_capital_flow(stock_code, top_n=top_n)
+            except Exception as exc:  # noqa: BLE001 - fail-open
+                logger.debug("[HithinkFundamental] fallback capital_flow 失败: %s", exc)
+                fallback_flow = {}
+            if isinstance(fallback_flow, dict):
+                if not result["stock_flow"] and fallback_flow.get("stock_flow"):
+                    result["stock_flow"] = fallback_flow["stock_flow"]
+                sector = fallback_flow.get("sector_rankings") or {}
+                if (sector.get("top") or sector.get("bottom")) and not (
+                    result["sector_rankings"]["top"] or result["sector_rankings"]["bottom"]
+                ):
+                    result["sector_rankings"] = sector
+                for entry in fallback_flow.get("source_chain", []):
+                    if entry not in result["source_chain"]:
+                        result["source_chain"].append(entry)
+                result["errors"].extend(fallback_flow.get("errors", []))
+        has_content = bool(
+            result["stock_flow"]
+            or result["sector_rankings"]["top"]
+            or result["sector_rankings"]["bottom"]
+        )
+        result["status"] = "partial" if has_content else "not_supported"
+        return result
+
+    def get_dragon_tiger_flag(self, stock_code: str, lookback_days: int = 20) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "status": "not_supported",
+            "is_on_list": False,
+            "recent_count": 0,
+            "latest_date": None,
+            "source_chain": [],
+            "errors": [],
+        }
+        target = _normalize_code(stock_code)
+        if not target:
+            return result
+        # 取近一年交易日，筛出 lookback 窗口内最近 5 个交易日逐日查榜（调用量上限 5 次）。
+        trading_days: List[str] = []
+        calendar = self._get("/api/a-share/calendar/trading-days")
+        if calendar:
+            for entry in calendar.get("item") or []:
+                date_str = str(entry.get("date") or "")
+                if len(date_str) == 8:
+                    trading_days.append(date_str)
+        now = datetime.now()
+        start = now - timedelta(days=max(1, lookback_days))
+        recent_days = [
+            d
+            for d in trading_days
+            if start <= datetime.strptime(d, "%Y%m%d") <= now
+        ][-5:]
+        if not recent_days:
+            recent_days = [None]  # 日历取不到时只查服务端最近可用交易日
+        matched_dates: List[str] = []
+        for day in recent_days:
+            params: Dict[str, Any] = {"board_type": "all"}
+            if day:
+                params["date"] = f"{day[0:4]}-{day[4:6]}-{day[6:8]}"
+            data = self._get("/api/a-share/special-data/dragon-tiger-list", params)
+            if not data:
+                continue
+            result["source_chain"].append("dragon_tiger:hithink_dragon_tiger_list")
+            codes = {
+                _normalize_code(item.get("thscode") or item.get("ticker"))
+                for item in data.get("stock_items") or []
+            }
+            if target in codes and day:
+                matched_dates.append(day)
+            elif target in codes and not day:
+                matched_dates.append(now.strftime("%Y%m%d"))
+        if matched_dates:
+            result["is_on_list"] = True
+            result["recent_count"] = len(matched_dates)
+            result["latest_date"] = max(matched_dates)
+            result["status"] = "ok"
+        elif result["source_chain"]:
+            result["status"] = "ok"
         return result

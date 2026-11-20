@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [新功能] 接入同花顺 Hithink Financial-API 作为 A 股第一优先级数据源（HITHINK_API_KEY），覆盖日 K、实时行情、指数、大盘统计、板块/概念榜、涨停池、人气股、财报与估值；Hithink 未覆盖的业绩预告/快报/分红/机构持股块仍由 Akshare 回填，全部失败时沿用原有 fallback 链。
 - [修复] 妙想补充查询采用跨实例/筹码与资金流共享的非阻塞准入及超时隔离，避免过期后台请求排队消耗额度；明确排除日线能力，并统一列表型 nameMap 的选表与解析。
 - [修复] 默认 Web smoke 排除独立 fixture 目录，避免无密码且未启动 Web 服务时错误收集选股用例；CI 同时验收默认和 fixture 入口。
 - [测试] 强化无理由 LLM 排序回归，验证双候选实际重排（含缺省和零分、risk-only 响应）后保留本地 observed 因子、模型 inferred 标记与 partial 综合质量。
